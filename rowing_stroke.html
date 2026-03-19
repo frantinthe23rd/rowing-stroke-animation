@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rowing Stroke Animation</title>
+<style>
+  body {
+    background: #f5f5f0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    font-family: Georgia, serif;
+    padding: 20px;
+    margin: 0;
+  }
+  h1 { margin: 0 0 4px; font-size: 1.4rem; color: #2c2c2c; }
+  p.sub { margin: 0 0 16px; font-size: 0.85rem; color: #666; }
+  canvas {
+    background: white;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    max-width: 100%;
+  }
+  .controls {
+    margin-top: 16px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 0.95rem;
+    color: #333;
+  }
+  .controls label { font-weight: bold; }
+  input[type=range] { width: 220px; cursor: pointer; }
+  #spmDisplay {
+    background: #2c2c2c;
+    color: #f0f0f0;
+    padding: 2px 10px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 1rem;
+    min-width: 60px;
+    text-align: center;
+  }
+  .phase-label {
+    margin-top: 10px;
+    font-size: 0.9rem;
+    color: #555;
+    height: 1.2em;
+  }
+  .legend {
+    margin-top: 12px;
+    display: flex;
+    gap: 20px;
+    font-size: 0.8rem;
+    color: #555;
+  }
+  .legend span { display: flex; align-items: center; gap: 5px; }
+</style>
+</head>
+<body>
+<h1>Rowing Stroke Animation</h1>
+<p class="sub">Drive phase (1/3) · Recovery phase (2/3)</p>
+
+<canvas id="canvas" width="860" height="340"></canvas>
+
+<div class="controls">
+  <label for="spmSlider">SPM:</label>
+  <input type="range" id="spmSlider" min="10" max="35" step="1" value="20">
+  <div id="spmDisplay">20 spm</div>
+</div>
+<div class="phase-label" id="phaseLabel">Phase: Catch</div>
+<div class="legend">
+  <span style="gap:5px;display:flex;align-items:center">
+    <svg width="22" height="8"><line x1="0" y1="4" x2="22" y2="4" stroke="#333" stroke-width="3" stroke-linecap="round"/></svg> Legs
+  </span>
+  <span style="gap:5px;display:flex;align-items:center">
+    <svg width="22" height="8"><line x1="0" y1="4" x2="22" y2="4" stroke="#1a56db" stroke-width="3" stroke-linecap="round"/></svg> Torso
+  </span>
+  <span style="gap:5px;display:flex;align-items:center">
+    <svg width="22" height="8"><line x1="0" y1="4" x2="22" y2="4" stroke="#c0392b" stroke-width="3" stroke-linecap="round"/></svg> Arms
+  </span>
+  <span style="gap:5px;display:flex;align-items:center">
+    <svg width="14" height="14"><circle cx="7" cy="7" r="6" fill="#e8c49a" stroke="#8b6914" stroke-width="1.5"/></svg> Head
+  </span>
+</div>
+
+<script>
+// ─── Segment lengths (cm) ─────────────────────────────────────────────────
+const L_thigh     = 40;
+const L_shin      = 40;
+const L_torso     = 36;
+const L_neck      = 13;
+const arm_length  = 40;
+const head_radius = 7;
+const foot_offset = 6;    // foot is 6 cm below seat rail
+
+// ─── Slide geometry ───────────────────────────────────────────────────────
+// X_offset=70, L_slide=52 chosen so that at catch the foot is only ~26 cm
+// ahead of the hip horizontally → shins ~8° from vertical (near-vertical).
+// At finish the hip is 80 cm from the foot → legs almost fully extended.
+const X_offset = 70;
+const L_slide  = 52;
+const foot_fixed = [X_offset - L_slide + (L_thigh + L_shin), -foot_offset]; // [98, -6]
+
+// ─── Torso angles ─────────────────────────────────────────────────────────
+// 60° from horizontal at catch  = 30° forward lean from vertical
+// 120° from horizontal at finish = 30° lay-back from vertical
+// sin(60°) = sin(120°), so shoulder height is identical at catch & finish —
+// this is what keeps the handle level throughout the drive.
+const catch_angle  = 60;
+const finish_angle = 120;
+
+// ─── Stroke timing (t in [0,1]) ───────────────────────────────────────────
+const drive_phase_end   = 0.33;   // drive ends at 1/3 of stroke period
+const t_leg_finish      = 0.20;   // legs fully extended
+const t_torso_release   = 0.55;   // recovery: slide starts forward
+
+const drive_swing_start = t_leg_finish;
+const drive_swing_end   = drive_phase_end;
+
+// Arms start drawing at 0.25 so there is a proper arm-pull window inside the
+// drive (legs done ~0.20, body swings 0.20→0.33, arms pull 0.25→0.33).
+const t_arm_retract_start = 0.25;
+const t_arm_extend_end    = 0.40;   // recovery: arms extend back out
+const t_arm_lift_start    = 0.95;   // last moment: blade extraction lift
+const t_arm_lift_end      = 1.0;
+const tap_depth = 5;                // downward drop of handle at finish
+
+// ─── Inverse kinematics ───────────────────────────────────────────────────
+function computeKnee(hip, foot) {
+  const dx = foot[0] - hip[0], dy = foot[1] - hip[1];
+  let d = Math.sqrt(dx*dx + dy*dy);
+  d = Math.max(1e-6, Math.min(d, L_thigh + L_shin));
+  const a = (L_thigh**2 - L_shin**2 + d**2) / (2*d);
+  const h = Math.sqrt(Math.max(0, L_thigh**2 - a**2));
+  const Px = hip[0] + a*(foot[0]-hip[0])/d;
+  const Py = hip[1] + a*(foot[1]-hip[1])/d;
+  const perpX = -(foot[1]-hip[1])/d;
+  const perpY =  (foot[0]-hip[0])/d;
+  const k1 = [Px + h*perpX, Py + h*perpY];
+  const k2 = [Px - h*perpX, Py - h*perpY];
+  return k1[1] > k2[1] ? k1 : k2;
+}
+
+// ─── Body positions at time t ─────────────────────────────────────────────
+function getPositions(t, H_fixed_y, H_tap_y, forceHandHeight) {
+  // Seat slide position
+  let slide;
+  if (t <= drive_phase_end) {
+    slide = -(t / drive_phase_end) * L_slide;
+  } else if (t < t_torso_release) {
+    slide = -L_slide;
+  } else {
+    const v = (t - t_torso_release) / (1 - t_torso_release);
+    slide = -L_slide + v * L_slide;
+  }
+  const hip = [slide + X_offset, 0];
+
+  // Legs — IK keeps shin attached to fixed footstretcher
+  const knee = computeKnee(hip, foot_fixed);
+  const foot = [...foot_fixed];
+
+  // Torso angle
+  let torso_angle;
+  if (t < t_leg_finish) {
+    torso_angle = catch_angle;                              // locked during leg drive
+  } else if (t <= drive_swing_end) {
+    const u = (t - drive_swing_start) / (drive_swing_end - drive_swing_start);
+    torso_angle = (1-u)*catch_angle + u*finish_angle;      // body swing
+  } else if (t < 0.45) {
+    torso_angle = finish_angle;                             // pause at lay-back
+  } else if (t < t_torso_release) {
+    const u = (t - 0.45) / (t_torso_release - 0.45);
+    torso_angle = (1-u)*finish_angle + u*catch_angle;      // body rocks forward
+  } else {
+    torso_angle = catch_angle;
+  }
+  const torso_rad = torso_angle * Math.PI / 180;
+  const shoulder = [hip[0] + L_torso*Math.cos(torso_rad), hip[1] + L_torso*Math.sin(torso_rad)];
+
+  // Arms
+  let hand;
+  if (t <= drive_phase_end) {
+    let arm_ext;
+    if (t < t_arm_retract_start) {
+      arm_ext = arm_length;                                 // arms locked out
+    } else {
+      const u = (t - t_arm_retract_start) / (drive_phase_end - t_arm_retract_start);
+      arm_ext = (1-u)*arm_length + u*10;                   // arms draw in
+    }
+    hand = [shoulder[0] + arm_ext, shoulder[1]];
+    // Force hand height to keep handle level throughout the drive
+    if (forceHandHeight && H_fixed_y !== null) hand[1] = H_fixed_y;
+
+  } else if (t < t_arm_extend_end) {
+    // Recovery: push arms away with tap-down
+    const u = (t - drive_phase_end) / (t_arm_extend_end - drive_phase_end);
+    const arm_ext = (1-u)*10 + u*arm_length;
+    hand = [shoulder[0] + arm_ext, shoulder[1] - u*tap_depth];
+    if (forceHandHeight && H_tap_y !== null) hand[1] = H_tap_y;
+
+  } else if (t < t_arm_lift_start) {
+    hand = [shoulder[0] + arm_length, shoulder[1] - tap_depth];
+    if (forceHandHeight && H_tap_y !== null) hand[1] = H_tap_y;
+
+  } else {
+    // Blade extraction lift
+    const u = (t - t_arm_lift_start) / (t_arm_lift_end - t_arm_lift_start);
+    hand = [shoulder[0] + arm_length, shoulder[1] - tap_depth*(1-u)];
+  }
+
+  // Bent only during the draw (t_arm_retract_start → drive_phase_end).
+  // Straight everywhere else: initial drive, tap-down, and full recovery.
+  const elbow = (t > t_arm_retract_start && t <= drive_phase_end)
+    ? [(shoulder[0]+hand[0])/2, hand[1]]                    // forearm horizontal during draw
+    : [(shoulder[0]+hand[0])/2, (shoulder[1]+hand[1])/2];  // straight arm
+  // Neck extends from shoulder tip; head is centred at the top of the neck.
+  // Arms attach at shoulder — below the neck — so they never cross the head.
+  const neckTip = [shoulder[0] + L_neck*Math.cos(torso_rad),
+                   shoulder[1] + L_neck*Math.sin(torso_rad)];
+  const head = neckTip;
+
+  return { hip, knee, foot, shoulder, neckTip, hand, elbow, head, torso_rad };
+}
+
+// ─── Precompute fixed hand heights (force=false first pass) ───────────────
+let H_fixed_y = null, H_tap_y = null;
+{
+  const p1 = getPositions(drive_phase_end - 1e-6, null, null, false);
+  H_fixed_y = p1.hand[1];
+  const p2 = getPositions(t_arm_extend_end, null, null, false);
+  H_tap_y = p2.hand[1];
+}
+
+// ─── Canvas coordinate transform ──────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// World extents sized to fit the new geometry comfortably
+const worldXMin = -22, worldXMax = 142;
+const worldYMin = -22, worldYMax = 62;
+const worldW = worldXMax - worldXMin;
+const worldH = worldYMax - worldYMin;
+
+function toCanvas(wx, wy) {
+  return [
+    (wx - worldXMin) / worldW * canvas.width,
+    canvas.height - 34 - (wy - worldYMin) / worldH * (canvas.height - 34)
+  ];
+}
+
+// ─── Drawing helpers ──────────────────────────────────────────────────────
+function strokePath(pts, color, lw) {
+  if (pts.length < 2) return;
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  const [x0, y0] = toCanvas(...pts[0]);
+  ctx.moveTo(x0, y0);
+  for (let i = 1; i < pts.length; i++) {
+    const [x, y] = toCanvas(...pts[i]);
+    ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function fillCircle(wx, wy, worldR, fill, strokeCol, strokeW) {
+  const [cx, cy] = toCanvas(wx, wy);
+  const r = worldR * canvas.width / worldW;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, 2*Math.PI);
+  ctx.fillStyle = fill;
+  ctx.fill();
+  if (strokeCol) {
+    ctx.strokeStyle = strokeCol;
+    ctx.lineWidth = strokeW || 1.5;
+    ctx.stroke();
+  }
+}
+
+function dot(wx, wy, r, fill) {
+  const [cx, cy] = toCanvas(wx, wy);
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, 2*Math.PI);
+  ctx.fillStyle = fill;
+  ctx.fill();
+}
+
+// ─── Phase label ──────────────────────────────────────────────────────────
+function phaseName(t) {
+  if (t < t_leg_finish)     return 'Drive — Leg press (shins vertical, hands level)';
+  if (t < drive_swing_end)  return 'Drive — Body swing';
+  if (t <= drive_phase_end) return 'Drive — Arms draw';
+  if (t < 0.45)             return 'Recovery — Arms away (tap down)';
+  if (t < t_torso_release)  return 'Recovery — Body over';
+  return 'Recovery — Slide forward to catch';
+}
+
+// ─── Animation ────────────────────────────────────────────────────────────
+let spm = 20;
+const startTime = performance.now();
+
+document.getElementById('spmSlider').addEventListener('input', function() {
+  spm = parseInt(this.value);
+  document.getElementById('spmDisplay').textContent = spm + ' spm';
+});
+
+function drawFrame(timestamp) {
+  const t = ((timestamp - startTime) / 1000 % (60/spm)) / (60/spm);
+  const { hip, knee, foot, shoulder, neckTip, hand, elbow, head, torso_rad } =
+        getPositions(t, H_fixed_y, H_tap_y, true);
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // ── Background ──────────────────────────────────────────────────────────
+  // Subtle horizontal grid
+  ctx.strokeStyle = '#f0f0f0'; ctx.lineWidth = 1;
+  for (let y = -20; y <= 60; y += 20) {
+    const [, cy] = toCanvas(0, y);
+    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(canvas.width, cy); ctx.stroke();
+  }
+
+  // Slide rail — two parallel lines to suggest a seat track
+  const railY1 =  1.5, railY2 = -1.5;
+  const railL = X_offset - L_slide - 4, railR = X_offset + 10;
+  strokePath([[railL, railY1],[railR, railY1]], '#bbb', 1.5);
+  strokePath([[railL, railY2],[railR, railY2]], '#bbb', 1.5);
+
+  // Footstretcher
+  strokePath([[foot_fixed[0], foot_fixed[1]-5],[foot_fixed[0], foot_fixed[1]+12]], '#888', 3);
+  // Foot block (shoe plate)
+  strokePath([[foot_fixed[0]-6, foot_fixed[1]+12],[foot_fixed[0]+6, foot_fixed[1]+12]], '#888', 3);
+
+  // Water / seat level baseline
+  ctx.setLineDash([7, 5]);
+  strokePath([[-20, 0],[145, 0]], '#aaa', 1);
+  ctx.setLineDash([]);
+
+  // ── Far leg (behind, lighter) ────────────────────────────────────────────
+  // Thigh
+  strokePath([hip, knee], '#bbb', 4);
+  // Shin
+  strokePath([knee, foot], '#bbb', 4);
+  dot(knee[0], knee[1], 4.5, '#ccc');
+
+  // ── Seat ────────────────────────────────────────────────────────────────
+  const [sx, sy] = toCanvas(hip[0], hip[1]);
+  const seatW = 14, seatH = 5;
+  ctx.fillStyle = '#999';
+  ctx.beginPath();
+  ctx.roundRect(sx - seatW/2, sy - seatH/2, seatW, seatH, 2);
+  ctx.fill();
+
+  // ── Near leg ────────────────────────────────────────────────────────────
+  // Thigh (hip to knee)
+  strokePath([hip, knee], '#2c2c2c', 5);
+  // Shin (knee to foot)
+  strokePath([knee, foot], '#2c2c2c', 5);
+  // Joints
+  dot(hip[0],  hip[1],  5,   '#555');
+  dot(knee[0], knee[1], 5.5, '#333');
+  dot(foot[0], foot[1], 4,   '#555');
+
+  // ── Torso ────────────────────────────────────────────────────────────────
+  strokePath([hip, shoulder], '#1a56db', 6);
+
+  // ── Arms ─────────────────────────────────────────────────────────────────
+  // Upper arm
+  strokePath([shoulder, elbow], '#c0392b', 4.5);
+  // Forearm
+  strokePath([elbow, hand], '#c0392b', 4);
+  // Handle grip — short bar at hand position to represent the oar handle
+  {
+    const [hx, hy] = toCanvas(hand[0], hand[1]);
+    const barLen = 7;
+    ctx.beginPath();
+    ctx.strokeStyle = '#7b241c';
+    ctx.lineWidth = 5;
+    ctx.lineCap = 'round';
+    ctx.moveTo(hx, hy - barLen);
+    ctx.lineTo(hx, hy + barLen);
+    ctx.stroke();
+  }
+  // Elbow joint
+  dot(elbow[0], elbow[1], 4, '#c0392b');
+
+  // ── Neck + Head ───────────────────────────────────────────────────────────
+  strokePath([shoulder, neckTip], '#e8c49a', 4);
+  fillCircle(head[0], head[1], head_radius, '#e8c49a', '#5a3a0a', 2);
+
+  // ── Progress bar ──────────────────────────────────────────────────────────
+  const barY = canvas.height - 20;
+  const barX = 50, barW = canvas.width - 100;
+
+  // Outer track (rounded)
+  ctx.fillStyle = '#e0e0e0';
+  ctx.beginPath(); ctx.roundRect(barX, barY-4, barW, 8, 4); ctx.fill();
+
+  // Drive progress — grows from 0 to drive_phase_end during drive
+  const driveFill = Math.min(t, drive_phase_end);
+  if (driveFill > 0) {
+    ctx.fillStyle = '#1a56db';
+    ctx.fillRect(barX, barY-4, barW * driveFill, 8);
+  }
+  // Recovery progress — grows from drive_phase_end to 1 during recovery
+  if (t > drive_phase_end) {
+    ctx.fillStyle = '#27ae60';
+    ctx.fillRect(barX + barW*drive_phase_end, barY-4,
+                 barW*(t - drive_phase_end), 8);
+  }
+
+  // Divider at drive/recovery boundary
+  const divX = barX + barW*drive_phase_end;
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(divX, barY-4); ctx.lineTo(divX, barY+4); ctx.stroke();
+
+  // Track border
+  ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.roundRect(barX, barY-4, barW, 8, 4); ctx.stroke();
+
+  // Position marker
+  const mx = barX + barW*t;
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.roundRect(mx-2, barY-7, 4, 14, 2); ctx.fill();
+
+  // Labels
+  ctx.fillStyle = '#666'; ctx.font = '10px Georgia'; ctx.textAlign = 'center';
+  ctx.fillText('Catch', barX, barY - 11);
+  ctx.fillText('▲ Drive end', divX, barY - 11);
+  ctx.fillText('Finish', barX + barW, barY - 11);
+  // Section labels inside the bar
+  ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.font = 'bold 9px Georgia';
+  ctx.fillText('DRIVE', barX + barW*drive_phase_end/2, barY + 3);
+  ctx.fillText('RECOVERY', barX + barW*(drive_phase_end + 1)/2, barY + 3);
+
+  document.getElementById('phaseLabel').textContent = 'Phase: ' + phaseName(t);
+
+  requestAnimationFrame(drawFrame);
+}
+
+requestAnimationFrame(drawFrame);
+</script>
+</body>
+</html>
